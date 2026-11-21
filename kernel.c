@@ -17,7 +17,7 @@
 #define CON_BOT 23
 
 #define OS_NAME "MyOS"
-#define OS_VERSION "0.5"
+#define OS_VERSION "0.6"
 
 static size_t cur_x, cur_y;
 static uint8_t color = 0x0F;       /* shell text attribute: white on black */
@@ -194,6 +194,232 @@ static int parse_num(const char **pp, int32_t *out) {
     return 1;
 }
 
+/* ---------- RAM filesystem (flat, in memory, lost on reboot) ---------- */
+/* FS-BEGIN (pure C, no I/O: extracted and unit-tested on the host) */
+#define FS_FILES 16
+#define FS_NAME  16
+#define FS_SIZE  2048
+
+struct fs_file {
+    bool used;
+    char name[FS_NAME];
+    uint16_t size;
+    char data[FS_SIZE];
+};
+static struct fs_file fs[FS_FILES];
+
+enum { FS_OK = 0, FS_ERR_FULL = -1, FS_ERR_EXISTS = -2, FS_ERR_NAME = -3, FS_ERR_NOFILE = -4 };
+
+static bool fs_valid_name(const char *n) {
+    size_t len = strlen(n);
+    if (len == 0 || len >= FS_NAME) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = n[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static int fs_find(const char *name) {
+    for (int i = 0; i < FS_FILES; i++)
+        if (fs[i].used && !strcmp(fs[i].name, name)) return i;
+    return -1;
+}
+
+/* Returns the new file's index, or a negative FS_ERR_* code. */
+static int fs_create(const char *name) {
+    if (!fs_valid_name(name)) return FS_ERR_NAME;
+    if (fs_find(name) >= 0) return FS_ERR_EXISTS;
+    for (int i = 0; i < FS_FILES; i++)
+        if (!fs[i].used) {
+            fs[i].used = true;
+            strcopy(fs[i].name, name, FS_NAME);
+            fs[i].size = 0;
+            return i;
+        }
+    return FS_ERR_FULL;
+}
+
+static void fs_delete(int i) {
+    fs[i].used = false;
+    fs[i].size = 0;
+    fs[i].name[0] = 0;
+}
+
+static int fs_rename(int i, const char *newname) {
+    if (!fs_valid_name(newname)) return FS_ERR_NAME;
+    int j = fs_find(newname);
+    if (j >= 0 && j != i) return FS_ERR_EXISTS;
+    strcopy(fs[i].name, newname, FS_NAME);
+    return FS_OK;
+}
+
+/* Replaces the contents; returns bytes stored (truncated to FS_SIZE). */
+static size_t fs_set(int i, const char *data, size_t len) {
+    if (len > FS_SIZE) len = FS_SIZE;
+    for (size_t k = 0; k < len; k++) fs[i].data[k] = data[k];
+    fs[i].size = (uint16_t)len;
+    return len;
+}
+
+/* Appends; returns bytes actually appended (0 when the file is full). */
+static size_t fs_append(int i, const char *data, size_t len) {
+    size_t room = (size_t)FS_SIZE - fs[i].size;
+    if (len > room) len = room;
+    for (size_t k = 0; k < len; k++) fs[i].data[fs[i].size + k] = data[k];
+    fs[i].size = (uint16_t)(fs[i].size + len);
+    return len;
+}
+
+/* Copies file src to a new file; returns the new index or an FS_ERR_* code. */
+static int fs_copy(int src, const char *dstname) {
+    int d = fs_create(dstname);
+    if (d < 0) return d;
+    fs_set(d, fs[src].data, fs[src].size);
+    return d;
+}
+
+static int fs_count(void) {
+    int n = 0;
+    for (int i = 0; i < FS_FILES; i++) if (fs[i].used) n++;
+    return n;
+}
+
+static uint32_t fs_bytes(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < FS_FILES; i++) if (fs[i].used) n += fs[i].size;
+    return n;
+}
+
+/* Index of the n-th used file (0-based), or -1. Used by the Files tab. */
+static int fs_nth(int n) {
+    for (int i = 0; i < FS_FILES; i++)
+        if (fs[i].used && n-- == 0) return i;
+    return -1;
+}
+
+/* Creates a file with initial text; ignores errors (used for seed files). */
+static void fs_seed(const char *name, const char *text) {
+    int i = fs_create(name);
+    if (i >= 0) fs_set(i, text, strlen(text));
+}
+/* FS-END */
+
+/* ---------- text editor core (buffer operations, no drawing) ---------- */
+/* ED-BEGIN (pure C: extracted and unit-tested on the host) */
+static char ed_buf[FS_SIZE];
+static size_t ed_len, ed_cur;                  /* text length, cursor offset */
+static bool ed_dirty;
+
+static size_t ed_line_start(size_t pos) {
+    while (pos > 0 && ed_buf[pos - 1] != '\n') pos--;
+    return pos;
+}
+static size_t ed_line_end(size_t pos) {
+    while (pos < ed_len && ed_buf[pos] != '\n') pos++;
+    return pos;
+}
+static size_t ed_cur_line(void) {              /* 0-based */
+    size_t n = 0;
+    for (size_t i = 0; i < ed_cur; i++) if (ed_buf[i] == '\n') n++;
+    return n;
+}
+static size_t ed_cur_col(void) { return ed_cur - ed_line_start(ed_cur); }
+
+static bool ed_insert(char c) {
+    if (ed_len >= FS_SIZE) return false;
+    for (size_t i = ed_len; i > ed_cur; i--) ed_buf[i] = ed_buf[i - 1];
+    ed_buf[ed_cur++] = c;
+    ed_len++;
+    ed_dirty = true;
+    return true;
+}
+static void ed_backspace(void) {
+    if (!ed_cur) return;
+    for (size_t i = ed_cur - 1; i + 1 < ed_len; i++) ed_buf[i] = ed_buf[i + 1];
+    ed_cur--; ed_len--;
+    ed_dirty = true;
+}
+static void ed_delete(void) {
+    if (ed_cur >= ed_len) return;
+    for (size_t i = ed_cur; i + 1 < ed_len; i++) ed_buf[i] = ed_buf[i + 1];
+    ed_len--;
+    ed_dirty = true;
+}
+static void ed_left(void)  { if (ed_cur) ed_cur--; }
+static void ed_right(void) { if (ed_cur < ed_len) ed_cur++; }
+static void ed_home(void)  { ed_cur = ed_line_start(ed_cur); }
+static void ed_end(void)   { ed_cur = ed_line_end(ed_cur); }
+static void ed_up(void) {
+    size_t ls = ed_line_start(ed_cur);
+    if (ls == 0) return;                       /* already on the first line */
+    size_t col = ed_cur - ls;
+    size_t ps = ed_line_start(ls - 1);
+    size_t plen = ls - 1 - ps;
+    ed_cur = ps + (col < plen ? col : plen);
+}
+static void ed_down(void) {
+    size_t le = ed_line_end(ed_cur);
+    if (le >= ed_len) return;                  /* already on the last line */
+    size_t col = ed_cur - ed_line_start(ed_cur);
+    size_t ns = le + 1;
+    size_t nlen = ed_line_end(ns) - ns;
+    ed_cur = ns + (col < nlen ? col : nlen);
+}
+static void ed_load(const char *data, size_t len) {
+    if (len > FS_SIZE) len = FS_SIZE;
+    for (size_t i = 0; i < len; i++) ed_buf[i] = data[i];
+    ed_len = len; ed_cur = 0; ed_dirty = false;
+}
+/* ED-END */
+
+/* Editor session: which file is open, scroll position, status message. */
+static char ed_name[FS_NAME];
+static bool ed_loaded;
+static size_t ed_top, ed_left_col;
+static char ed_msg[48];
+
+static void ed_set_msg(const char *m) { strcopy(ed_msg, m, sizeof ed_msg); }
+
+/* Opens (creating if needed) a file in the editor. Returns 0 or an FS_ERR_*. */
+static int ed_open(const char *name) {
+    bool same = ed_loaded && !strcmp(ed_name, name);
+    if (same && ed_dirty) { ed_set_msg("Back to your unsaved edits"); return 0; }
+
+    int i = fs_find(name);
+    bool created = false;
+    if (i < 0) {
+        i = fs_create(name);
+        if (i < 0) return i;
+        created = true;
+    }
+    if (ed_loaded && ed_dirty) {               /* switching away from edits */
+        ed_set_msg("Discarded unsaved changes to ");
+        catstr(ed_msg, ed_name, sizeof ed_msg);
+    } else {
+        ed_set_msg(created ? "New file" : "Opened");
+    }
+    ed_load(fs[i].data, fs[i].size);
+    strcopy(ed_name, name, FS_NAME);
+    ed_loaded = true;
+    ed_top = 0; ed_left_col = 0;
+    return 0;
+}
+
+static void ed_save(void) {
+    if (!ed_loaded) return;
+    int i = fs_find(ed_name);
+    if (i < 0) {                               /* deleted meanwhile: recreate */
+        i = fs_create(ed_name);
+        if (i < 0) { ed_set_msg("Save failed: filesystem full"); return; }
+    }
+    fs_set(i, ed_buf, ed_len);
+    ed_dirty = false;
+    ed_set_msg("Saved");
+}
+
 /* ---------- direct VGA drawing (for UI pages and games) ---------- */
 static void vga_put(int x, int y, char ch, uint8_t attr) {
     VGA_MEM[y * VGA_W + x] = (uint16_t)(uint8_t)ch | (uint16_t)attr << 8;
@@ -262,13 +488,40 @@ static void sleep_ms(uint32_t ms) {
     while (acc < need) acc += pit_elapsed(&prev);
 }
 
+/* ---------- PC speaker (PIT channel 2) ---------- */
+static bool set_sound = true;
+
+static void speaker_on(uint32_t hz) {
+    if (hz < 20) hz = 20;
+    if (hz > 20000) hz = 20000;
+    uint32_t div = PIT_HZ / hz;
+    outb(0x43, 0xB6);                          /* channel 2, lo/hi byte, square wave */
+    outb(0x42, (uint8_t)(div & 0xFF));
+    outb(0x42, (uint8_t)(div >> 8));
+    outb(0x61, (uint8_t)(inb(0x61) | 3));      /* gate the PIT to the speaker */
+}
+static void speaker_off(void) { outb(0x61, (uint8_t)(inb(0x61) & 0xFC)); }
+
+static void beep(uint32_t hz, uint32_t ms) {
+    if (!set_sound) return;
+    speaker_on(hz);
+    sleep_ms(ms);
+    speaker_off();
+}
+
 /* ---------- keyboard (polled, scancode set 1, US layout) ---------- */
 #define KEY_UP    0x100
 #define KEY_DOWN  0x101
 #define KEY_LEFT  0x102
 #define KEY_RIGHT 0x103
-#define KEY_F1    0x110     /* F1..F4 = 0x110..0x113 */
-#define KEY_F4    0x113
+#define KEY_F1    0x110     /* F1..F6 = 0x110..0x115 */
+#define KEY_F6    0x115
+#define KEY_HOME  0x120
+#define KEY_END   0x121
+#define KEY_DEL   0x122
+#define KEY_PGUP  0x123
+#define KEY_PGDN  0x124
+#define KEY_CTRL(c) (0x200 | (c))   /* Ctrl + lowercase letter */
 
 static const char map_lo[128] = {
     0, 27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
@@ -287,6 +540,7 @@ static const char map_hi[128] = {
 
 static bool shift;
 static bool caps;
+static bool ctrl;
 static bool e0;                                /* saw 0xE0 extended prefix */
 
 /* Non-blocking: returns a character, a KEY_* code, or -1 if nothing. */
@@ -297,23 +551,34 @@ static int getkey_nb(void) {
     if (sc == 0xE0) { e0 = true; return -1; }
     if (e0) {
         e0 = false;
+        if (sc == 0x1D) { ctrl = true;  return -1; }   /* right Ctrl */
+        if (sc == 0x9D) { ctrl = false; return -1; }
         if (sc & 0x80) return -1;              /* extended key release */
         switch (sc) {
         case 0x48: return KEY_UP;
         case 0x50: return KEY_DOWN;
         case 0x4B: return KEY_LEFT;
         case 0x4D: return KEY_RIGHT;
+        case 0x47: return KEY_HOME;
+        case 0x4F: return KEY_END;
+        case 0x53: return KEY_DEL;
+        case 0x49: return KEY_PGUP;
+        case 0x51: return KEY_PGDN;
         default:   return -1;
         }
     }
+
+    if (sc == 0x1D) { ctrl = true;  return -1; }   /* left Ctrl */
+    if (sc == 0x9D) { ctrl = false; return -1; }
 
     if (sc == 0x2A || sc == 0x36) { shift = true;  return -1; }
     if (sc == 0xAA || sc == 0xB6) { shift = false; return -1; }
     if (sc == 0x3A) { caps = !caps; return -1; }   /* Caps Lock press */
     if (sc & 0x80) return -1;                      /* key release */
-    if (sc >= 0x3B && sc <= 0x3E) return KEY_F1 + (sc - 0x3B);
+    if (sc >= 0x3B && sc <= 0x40) return KEY_F1 + (sc - 0x3B);   /* F1..F6 */
 
     char lo = map_lo[sc];
+    if (ctrl) return (lo >= 'a' && lo <= 'z') ? KEY_CTRL(lo) : -1;
     /* Caps Lock only affects letters; Shift affects everything. */
     bool letter = lo >= 'a' && lo <= 'z';
     bool upper = letter ? (shift != caps) : shift;
@@ -424,9 +689,10 @@ static void cpu_brand(char *out) {             /* out must hold 49 bytes */
 }
 
 /* ---------- UI state shared with the game and shell ---------- */
-enum { TAB_SHELL, TAB_INFO, TAB_SETTINGS, TAB_GAMES, TAB_COUNT };
+enum { TAB_SHELL, TAB_INFO, TAB_SETTINGS, TAB_GAMES, TAB_FILES, TAB_EDITOR, TAB_COUNT };
 
 static int cur_tab = TAB_SHELL;
+static int pending_tab = -1;                   /* tab to switch to after a command */
 static uint16_t pit_prev;                      /* main loop's PIT reading */
 static uint32_t snake_best;
 static bool set_clock = true;                  /* show clock in status bar */
@@ -444,8 +710,9 @@ static void snap_restore(void) {
     cur_x = snap_x; cur_y = snap_y;
     update_cursor();
 }
-static void ui_apply_cursor(void) {            /* only the Shell shows a cursor */
+static void ui_apply_cursor(void) {            /* Shell and Editor show a cursor */
     if (cur_tab == TAB_SHELL) { cursor_show(); update_cursor(); }
+    else if (cur_tab == TAB_EDITOR && ed_loaded) cursor_show();   /* ed_draw positions it */
     else cursor_hide();
 }
 
@@ -515,6 +782,7 @@ static void splash(void) {
         sleep_ms(75);
         vga_put(bx + i, by, (char)0xDB, 0x0A);
     }
+    beep(523, 90); beep(659, 90); beep(784, 180);   /* boot chime: C E G */
     sleep_ms(150);
 }
 
@@ -658,6 +926,253 @@ static uint32_t launch_snake(void) {
     return sc;
 }
 
+/* ---------- tetris ---------- */
+/* TET-BEGIN (game rules only, no I/O: extracted and fuzz-tested on the host) */
+#define TW 10
+#define TH 20
+
+static uint8_t tboard[TH][TW];                 /* 0 = empty, else piece type + 1 */
+/* 4x4 bitmaps, bit = y*4 + x:  I O T S Z J L */
+static const uint16_t tshape[7] = { 0x00F0, 0x0660, 0x0072, 0x0036, 0x0063, 0x0071, 0x0074 };
+static int tbag[7], tbag_i = 7;                /* 7-bag randomizer */
+static int t_type, t_next;
+static uint16_t t_mask;                        /* current piece, rotated */
+static int t_px, t_py;                         /* top-left of its 4x4 box */
+static uint32_t t_score, t_lines, t_level;
+static bool t_over;
+
+static uint16_t t_rot(uint16_t m) {            /* rotate 90 degrees clockwise */
+    uint16_t r = 0;
+    for (int i = 0; i < 16; i++)
+        if (m & (1u << i)) {
+            int x = i & 3, y = i >> 2;
+            r |= (uint16_t)(1u << ((3 - y) + 4 * x));
+        }
+    return r;
+}
+
+static bool t_fits(uint16_t m, int px, int py) {
+    for (int i = 0; i < 16; i++)
+        if (m & (1u << i)) {
+            int x = px + (i & 3), y = py + (i >> 2);
+            if (x < 0 || x >= TW || y >= TH) return false;
+            if (y >= 0 && tboard[y][x]) return false;      /* y < 0: above the board */
+        }
+    return true;
+}
+
+static int t_take_bag(void) {
+    if (tbag_i >= 7) {
+        for (int i = 0; i < 7; i++) tbag[i] = i;
+        for (int i = 6; i > 0; i--) {
+            int j = (int)(rnd() % (uint32_t)(i + 1));
+            int t = tbag[i]; tbag[i] = tbag[j]; tbag[j] = t;
+        }
+        tbag_i = 0;
+    }
+    return tbag[tbag_i++];
+}
+
+static void t_spawn(void) {
+    t_type = t_next;
+    t_next = t_take_bag();
+    t_mask = tshape[t_type];
+    t_px = 3; t_py = -1;
+    if (!t_fits(t_mask, t_px, t_py)) t_over = true;
+}
+
+static void t_new_game(void) {
+    for (int y = 0; y < TH; y++) for (int x = 0; x < TW; x++) tboard[y][x] = 0;
+    t_score = 0; t_lines = 0; t_level = 1; t_over = false;
+    tbag_i = 7;
+    t_next = t_take_bag();
+    t_spawn();
+}
+
+static bool t_move(int dx) {
+    if (!t_fits(t_mask, t_px + dx, t_py)) return false;
+    t_px += dx;
+    return true;
+}
+
+static bool t_rotate_piece(void) {             /* with simple wall kicks */
+    static const int kicks[5] = { 0, -1, 1, -2, 2 };
+    uint16_t r = t_rot(t_mask);
+    for (int k = 0; k < 5; k++)
+        if (t_fits(r, t_px + kicks[k], t_py)) {
+            t_mask = r; t_px += kicks[k];
+            return true;
+        }
+    return false;
+}
+
+static int t_clear_lines(void) {
+    int cleared = 0;
+    for (int y = TH - 1; y >= 0; ) {
+        bool full = true;
+        for (int x = 0; x < TW; x++) if (!tboard[y][x]) { full = false; break; }
+        if (!full) { y--; continue; }
+        for (int r = y; r > 0; r--)
+            for (int x = 0; x < TW; x++) tboard[r][x] = tboard[r - 1][x];
+        for (int x = 0; x < TW; x++) tboard[0][x] = 0;
+        cleared++;                             /* same y again: rows shifted down */
+    }
+    return cleared;
+}
+
+/* Fixes the piece on the board, scores any lines and spawns the next piece. */
+static void t_lock_piece(void) {
+    static const uint32_t pts[5] = { 0, 100, 300, 500, 800 };
+    for (int i = 0; i < 16; i++)
+        if (t_mask & (1u << i)) {
+            int x = t_px + (i & 3), y = t_py + (i >> 2);
+            if (y < 0) t_over = true;          /* locked above the visible board */
+            else tboard[y][x] = (uint8_t)(t_type + 1);
+        }
+    int n = t_clear_lines();
+    t_lines += (uint32_t)n;
+    t_score += pts[n] * t_level;
+    t_level = 1 + t_lines / 10;
+    if (!t_over) t_spawn();
+}
+
+/* One gravity step. Returns true if the piece locked instead of moving. */
+static bool t_step_down(void) {
+    if (t_fits(t_mask, t_px, t_py + 1)) { t_py++; return false; }
+    t_lock_piece();
+    return true;
+}
+
+static void t_hard_drop(void) {
+    uint32_t n = 0;
+    while (t_fits(t_mask, t_px, t_py + 1)) { t_py++; n++; }
+    t_score += 2 * n;
+    t_lock_piece();
+}
+/* TET-END */
+
+static uint32_t tetris_best;
+
+#define TB_X 26                                /* board: 2 screen columns per cell */
+#define TB_Y 2
+static const uint8_t tcol[7] = { 0x0B, 0x0E, 0x0D, 0x0A, 0x0C, 0x09, 0x06 };
+
+static void tet_cell(int x, int y, uint8_t a) {
+    vga_put(TB_X + 2 * x,     TB_Y + y, (char)0xDB, a);
+    vga_put(TB_X + 2 * x + 1, TB_Y + y, (char)0xDB, a);
+}
+
+static void tet_frame(void) {
+    vga_text(0, 0, "TETRIS", 0x0F);
+    for (int y = 0; y < TH; y++) {
+        vga_put(TB_X - 1, TB_Y + y, (char)0xDB, 0x08);
+        vga_put(TB_X + 2 * TW, TB_Y + y, (char)0xDB, 0x08);
+    }
+    for (int x = -1; x <= 2 * TW; x++) vga_put(TB_X + x, TB_Y + TH, (char)0xDB, 0x08);
+    vga_text(2, 4,  "Left/Right  move", 0x07);
+    vga_text(2, 5,  "Up          rotate", 0x07);
+    vga_text(2, 6,  "Down        soft drop", 0x07);
+    vga_text(2, 7,  "Space       hard drop", 0x07);
+    vga_text(2, 8,  "P           pause", 0x07);
+    vga_text(2, 9,  "Q / Esc     quit", 0x07);
+    vga_text(50, 3, "NEXT", 0x03);
+    vga_text(50, 10, "SCORE", 0x03);
+    vga_text(50, 13, "LINES", 0x03);
+    vga_text(50, 16, "LEVEL", 0x03);
+}
+
+static void tet_draw(bool paused) {
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++) {
+            uint8_t v = tboard[y][x];
+            if (v) tet_cell(x, y, tcol[v - 1]);
+            else {
+                vga_put(TB_X + 2 * x, TB_Y + y, (char)0xFA, 0x08);
+                vga_put(TB_X + 2 * x + 1, TB_Y + y, ' ', 0x07);
+            }
+        }
+    if (!t_over)
+        for (int i = 0; i < 16; i++)
+            if (t_mask & (1u << i)) {
+                int x = t_px + (i & 3), y = t_py + (i >> 2);
+                if (y >= 0 && y < TH && x >= 0 && x < TW) tet_cell(x, y, tcol[t_type]);
+            }
+
+    vga_clear_area(50, 4, 10, 4, 0x07);        /* next-piece preview */
+    for (int i = 0; i < 16; i++)
+        if (tshape[t_next] & (1u << i)) {
+            vga_put(51 + 2 * (i & 3),     4 + (i >> 2), (char)0xDB, tcol[t_next]);
+            vga_put(51 + 2 * (i & 3) + 1, 4 + (i >> 2), (char)0xDB, tcol[t_next]);
+        }
+
+    vga_clear_area(50, 11, 10, 1, 0x07); vga_num(50, 11, t_score, 0x0F);
+    vga_clear_area(50, 14, 10, 1, 0x07); vga_num(50, 14, t_lines, 0x0F);
+    vga_clear_area(50, 17, 10, 1, 0x07); vga_num(50, 17, t_level, 0x0F);
+
+    if (paused) vga_text(TB_X + 7, TB_Y + 9, " PAUSED ", 0x4F);
+}
+
+/* Takes over the whole screen. Returns the score; caller restores the UI. */
+static uint32_t tetris(void) {
+    rng_state = rdtsc_lo() | 1u;
+    cursor_hide();
+    for (size_t i = 0; i < VGA_W * VGA_H; i++) VGA_MEM[i] = 0x0720;
+    tet_frame();
+    t_new_game();
+    tet_draw(false);
+
+    bool quit = false, paused = false;
+    uint32_t acc = 0;
+    uint16_t prev = pit_read();
+    while (!quit && !t_over) {
+        uint32_t d = pit_elapsed(&prev);
+        if (!paused) acc += d;
+        bool redraw = false;
+
+        int k = getkey_nb();
+        if (k >= 'A' && k <= 'Z') k += 32;
+        if (k == 'q' || k == 27) quit = true;
+        else if (k == 'p') { paused = !paused; redraw = true; }
+        else if (k >= 0 && !paused) {
+            if (k == KEY_LEFT || k == 'a')       redraw |= t_move(-1);
+            else if (k == KEY_RIGHT || k == 'd') redraw |= t_move(1);
+            else if (k == KEY_UP || k == 'w')    redraw |= t_rotate_piece();
+            else if (k == KEY_DOWN || k == 's') {
+                if (!t_step_down()) t_score++;   /* +1 per soft-dropped row */
+                acc = 0; redraw = true;
+            } else if (k == ' ') { t_hard_drop(); acc = 0; redraw = true; }
+        }
+
+        uint32_t delay_ms = t_level > 10 ? 100u : 800u - (t_level - 1) * 70u;
+        if (!paused && !t_over && acc >= delay_ms * 1193u) {
+            acc = 0;
+            t_step_down();
+            redraw = true;
+        }
+        if (redraw) tet_draw(paused);
+    }
+
+    if (!quit) {
+        tet_draw(false);
+        vga_text(TB_X + 5, TB_Y + 8,  "  GAME OVER  ", 0x4F);
+        vga_text(TB_X + 5, TB_Y + 10, " press a key  ", 0x07);
+        sleep_ms(600);
+        while (getkey_nb() >= 0) {}            /* drop keys pressed meanwhile */
+        getkey();
+    }
+    return t_score;
+}
+
+static uint32_t launch_tetris(void) {
+    snap_save();
+    uint32_t sc = tetris();
+    if (sc > tetris_best) tetris_best = sc;
+    snap_restore();
+    pit_prev = pit_read();
+    ui_apply_cursor();
+    return sc;
+}
+
 /* ---------- shell commands ---------- */
 static void cmd_time(void) {
     struct rtc_time t;
@@ -713,13 +1228,176 @@ static void cmd_history(void) {
     }
 }
 
+/* ---------- file commands ---------- */
+/* If cmd is `name` or `name <args>`, returns a pointer to the args (possibly
+ * an empty string); otherwise NULL. */
+static const char *cmd_args(const char *cmd, const char *name) {
+    size_t n = strlen(name);
+    for (size_t i = 0; i < n; i++) if (cmd[i] != name[i]) return NULL;
+    if (cmd[n] == 0) return cmd + n;
+    if (cmd[n] != ' ') return NULL;
+    return skip_spaces(cmd + n);
+}
+
+/* Copies the next space-separated word into out and advances *pp. */
+static bool next_word(const char **pp, char *out, size_t max) {
+    const char *p = skip_spaces(*pp);
+    size_t n = 0;
+    while (*p && *p != ' ') { if (n + 1 < max) out[n++] = *p; p++; }
+    out[n] = 0;
+    *pp = p;
+    return n > 0;
+}
+
+static bool no_more(const char *a) { return !*skip_spaces(a); }   /* no extra words */
+
+static void fs_err(int e, const char *name) {
+    switch (e) {
+    case FS_ERR_FULL:
+        puts("Filesystem full (max "); put_dec(FS_FILES); puts(" files)\n"); break;
+    case FS_ERR_EXISTS:
+        puts(name); puts(": already exists\n"); break;
+    case FS_ERR_NAME:
+        puts("Bad file name (letters, digits . _ -  max "); put_dec(FS_NAME - 1);
+        puts(" chars)\n"); break;
+    default:
+        puts(name); puts(": no such file\n"); break;
+    }
+}
+
+static void cmd_ls(void) {
+    int n = fs_count();
+    if (!n) { puts("(no files)\n"); return; }
+    for (int k = 0; k < n; k++) {
+        int i = fs_nth(k);
+        puts(fs[i].name);
+        for (size_t c = strlen(fs[i].name); c < 18; c++) putc(' ');
+        put_dec(fs[i].size); puts(" B\n");
+    }
+    put_dec((uint32_t)n); puts(n == 1 ? " file, " : " files, ");
+    put_dec(fs_bytes()); puts(" bytes\n");
+}
+
+static void cmd_cat(int i) {
+    for (uint16_t k = 0; k < fs[i].size; k++) {
+        char c = fs[i].data[k];
+        putc((c < 32 && c != '\n') ? '.' : c);
+    }
+    if (fs[i].size && fs[i].data[fs[i].size - 1] != '\n') putc('\n');
+}
+
+/* write/append <file> <text>: adds a newline after the text. */
+static void cmd_write(const char *args, bool append) {
+    char name[LINE_MAX];
+    if (!next_word(&args, name, sizeof name)) {
+        puts(append ? "Usage: append <file> <text>\n" : "Usage: write <file> <text>\n");
+        return;
+    }
+    const char *text = skip_spaces(args);
+    int i = fs_find(name);
+    if (i < 0) { i = fs_create(name); if (i < 0) { fs_err(i, name); return; } }
+    size_t len = strlen(text), got;
+    if (append) { got = fs_append(i, text, len); got += fs_append(i, "\n", 1); }
+    else        { got = fs_set(i, text, len);    got += fs_append(i, "\n", 1); }
+    if (got < len + 1) puts("(file full: text was truncated)\n");
+}
+
+/* "Ode to Joy", first phrase: {frequency Hz, length ms}. */
+static const uint16_t tune_notes[][2] = {
+    {659,250},{659,250},{698,250},{784,250},{784,250},{698,250},{659,250},{587,250},
+    {523,250},{523,250},{587,250},{659,250},{659,375},{587,125},{587,500},
+};
+
+static void cmd_tune(void) {
+    if (!set_sound) { puts("Sound is off (turn it on in Settings, F3)\n"); return; }
+    puts("Playing... (press any key to stop)\n");
+    for (size_t i = 0; i < sizeof tune_notes / sizeof tune_notes[0]; i++) {
+        beep(tune_notes[i][0], tune_notes[i][1]);
+        sleep_ms(25);
+        if (getkey_nb() >= 0) break;
+    }
+}
+
+static void cmd_beep(const char *args) {
+    int32_t hz = 800, ms = 200;
+    if (*args && !parse_num(&args, &hz)) { puts("Usage: beep [hz] [ms]\n"); return; }
+    if (*skip_spaces(args) && !parse_num(&args, &ms)) { puts("Usage: beep [hz] [ms]\n"); return; }
+    if (hz < 20 || hz > 20000 || ms < 1 || ms > 5000) {
+        puts("Frequency 20-20000 Hz, length 1-5000 ms\n"); return;
+    }
+    if (!set_sound) { puts("Sound is off (turn it on in Settings, F3)\n"); return; }
+    beep((uint32_t)hz, (uint32_t)ms);
+}
+
+/* Handles the file-related commands; returns false if cmd is not one. */
+static bool run_files(const char *cmd) {
+    const char *a;
+    char w1[LINE_MAX], w2[LINE_MAX];
+    int i, e;
+
+    if (!strcmp(cmd, "ls") || !strcmp(cmd, "dir")) { cmd_ls(); return true; }
+    if (!strcmp(cmd, "tune")) { cmd_tune(); return true; }
+    if ((a = cmd_args(cmd, "beep"))) { cmd_beep(a); return true; }
+    if (!strcmp(cmd, "df")) {
+        puts("Files: "); put_dec((uint32_t)fs_count()); putc('/'); put_dec(FS_FILES);
+        puts("   Used: "); put_dec(fs_bytes());
+        puts(" B of "); put_dec((uint32_t)FS_FILES * FS_SIZE); puts(" B (RAM, lost on reboot)\n");
+        return true;
+    }
+    if ((a = cmd_args(cmd, "edit"))) {          /* opens the Editor tab afterwards */
+        if (!next_word(&a, w1, sizeof w1)) {
+            if (ed_loaded) pending_tab = TAB_EDITOR;
+            else puts("Usage: edit <file>\n");
+        } else if (!no_more(a)) puts("Usage: edit <file>\n");
+        else if ((e = ed_open(w1)) < 0) fs_err(e, w1);
+        else pending_tab = TAB_EDITOR;
+        return true;
+    }
+    if ((a = cmd_args(cmd, "cat"))) {
+        if (!next_word(&a, w1, sizeof w1) || !no_more(a)) puts("Usage: cat <file>\n");
+        else if ((i = fs_find(w1)) < 0) fs_err(FS_ERR_NOFILE, w1);
+        else cmd_cat(i);
+        return true;
+    }
+    if ((a = cmd_args(cmd, "touch"))) {
+        if (!next_word(&a, w1, sizeof w1) || !no_more(a)) puts("Usage: touch <file>\n");
+        else if (fs_find(w1) < 0 && (e = fs_create(w1)) < 0) fs_err(e, w1);
+        return true;
+    }
+    if ((a = cmd_args(cmd, "rm"))) {
+        if (!next_word(&a, w1, sizeof w1) || !no_more(a)) puts("Usage: rm <file>\n");
+        else if ((i = fs_find(w1)) < 0) fs_err(FS_ERR_NOFILE, w1);
+        else fs_delete(i);
+        return true;
+    }
+    if ((a = cmd_args(cmd, "mv"))) {
+        if (!next_word(&a, w1, sizeof w1) || !next_word(&a, w2, sizeof w2) || !no_more(a))
+            puts("Usage: mv <old> <new>\n");
+        else if ((i = fs_find(w1)) < 0) fs_err(FS_ERR_NOFILE, w1);
+        else if ((e = fs_rename(i, w2)) < 0) fs_err(e, w2);
+        return true;
+    }
+    if ((a = cmd_args(cmd, "cp"))) {
+        if (!next_word(&a, w1, sizeof w1) || !next_word(&a, w2, sizeof w2) || !no_more(a))
+            puts("Usage: cp <from> <to>\n");
+        else if ((i = fs_find(w1)) < 0) fs_err(FS_ERR_NOFILE, w1);
+        else if ((e = fs_copy(i, w2)) < 0) fs_err(e, w2);
+        return true;
+    }
+    if ((a = cmd_args(cmd, "write")))  { cmd_write(a, false); return true; }
+    if ((a = cmd_args(cmd, "append"))) { cmd_write(a, true);  return true; }
+    return false;
+}
+
 static void run(const char *cmd) {
     if (!*cmd) return;
     if (!strcmp(cmd, "help")) {
-        puts("help clear echo <text> rev <text> about ver mem cpu time\n");
+        puts("help clear echo <text> rev <text> about ver mem cpu time history\n");
         puts("hex <n>  dec <n>  calc <a> <op> <b>  color <0-15>  bg <0-15>\n");
-        puts("history snake reboot shutdown\n");
-        puts("F1-F4 switch tabs (Shell/Info/Settings/Games), Up/Down = history\n");
+        puts("Files:  ls cat <f> touch <f> rm <f> mv <a> <b> cp <a> <b> df\n");
+        puts("        write <f> <text>  append <f> <text>  edit <f>\n");
+        puts("Games:  snake tetris      Sound: beep [hz] [ms]  tune\n");
+        puts("reboot shutdown      F1-F6 switch tabs, Up/Down = history\n");
     } else if (!strcmp(cmd, "clear")) {
         clear_screen();
     } else if (!strcmp(cmd, "about")) {
@@ -745,6 +1423,10 @@ static void run(const char *cmd) {
         uint32_t sc = launch_snake();
         puts("Snake finished. Score: "); put_dec(sc);
         puts("  (best "); put_dec(snake_best); puts(")\n");
+    } else if (!strcmp(cmd, "tetris")) {
+        uint32_t sc = launch_tetris();
+        puts("Tetris finished. Score: "); put_dec(sc);
+        puts("  (best "); put_dec(tetris_best); puts(")\n");
     } else if (starts_with(cmd, "hex ")) {
         const char *p = cmd + 4; int32_t n;
         if (parse_num(&p, &n)) { put_hex((uint32_t)n); putc('\n'); }
@@ -769,7 +1451,7 @@ static void run(const char *cmd) {
         reboot();
     } else if (!strcmp(cmd, "shutdown")) {
         poweroff();
-    } else {
+    } else if (!run_files(cmd)) {
         puts("Unknown command: "); puts(cmd); putc('\n');
     }
 }
@@ -864,7 +1546,7 @@ static void vga_kv(int x, int y, const char *label, const char *value) {
 static void page_clear(void) { vga_clear_area(0, CON_TOP, VGA_W, CON_BOT - CON_TOP + 1, 0x07); }
 
 static const char *const tab_labels[TAB_COUNT] = {
-    "F1 Shell", "F2 Info", "F3 Settings", "F4 Games"
+    "F1 Shell", "F2 Info", "F3 Settings", "F4 Games", "F5 Files", "F6 Editor"
 };
 
 static void draw_tabbar(void) {
@@ -878,14 +1560,15 @@ static void draw_tabbar(void) {
         vga_text(x + 1, 0, tab_labels[i], a);
         x += w + 1;
     }
-    vga_text(VGA_W - (int)strlen("v" OS_VERSION) - 1, 0, "v" OS_VERSION, 0x70);
 }
 
 static const char *const tab_hints[TAB_COUNT] = {
-    " F1-F4: switch tabs  |  Up/Down: command history  |  try 'help'",
-    " F1-F4 or Tab: switch tabs  |  Esc: back to the Shell",
+    " F1-F6: tabs  |  Up/Down: history  |  try 'help', 'ls' or 'edit'",
+    " F1-F6 or Tab: switch tabs  |  Esc: back to the Shell",
     " Up/Down: select  |  Left/Right/Enter: change  |  Tab: next tab",
     " Up/Down: select  |  Enter: play  |  Tab: next tab",
+    " Enter: edit  |  N: new  |  R: rename  |  D: delete  |  Tab: next",
+    " Ctrl+S: save  |  Esc: back to Files  |  F1-F6: switch tabs",
 };
 
 static void draw_clock(const struct rtc_time *t) {
@@ -903,25 +1586,29 @@ static void draw_status(void) {
 
 /* ---------- Info tab ---------- */
 static void info_update(const struct rtc_time *t) {
-    vga_clear_area(52, 3, 25, 6, 0x07);
+    const int vx = 55;                         /* value column, right of the labels */
+    vga_clear_area(vx, 3, 22, 7, 0x07);
     int x;
-    x = vga_num(52, 3, t->y, 0x0F);
+    x = vga_num(vx, 3, t->y, 0x0F);
     vga_put(x, 3, '-', 0x0F); vga_num2(x + 1, 3, t->mo, 0x0F);
     vga_put(x + 3, 3, '-', 0x0F); vga_num2(x + 4, 3, t->d, 0x0F);
-    vga_hms(52, 4, t->h, t->m, t->s, 0x0F);
-    vga_text(61, 4, "(UTC in QEMU)", 0x08);
-    vga_hms(52, 5, uptime_sec / 3600, (uptime_sec / 60) % 60, uptime_sec % 60, 0x0F);
-    vga_text(52, 6, "PIT 1.193 MHz (polled)", 0x0F);
-    x = vga_num(52, 7, (uint32_t)hist_count, 0x0F);
+    vga_hms(vx, 4, t->h, t->m, t->s, 0x0F);
+    vga_text(vx + 9, 4, "(UTC in QEMU)", 0x08);
+    vga_hms(vx, 5, uptime_sec / 3600, (uptime_sec / 60) % 60, uptime_sec % 60, 0x0F);
+    int nf = fs_count();
+    x = vga_num(vx, 6, (uint32_t)nf, 0x0F);
+    vga_text(x, 6, nf == 1 ? " file" : " files", 0x0F);
+    x = vga_num(vx, 7, (uint32_t)hist_count, 0x0F);
     vga_text(x, 7, hist_count == 1 ? " entry" : " entries", 0x0F);
-    vga_num(52, 8, snake_best, 0x0F);
+    vga_num(vx, 8, snake_best, 0x0F);
+    vga_num(vx, 9, tetris_best, 0x0F);
 }
 
 static void info_draw(void) {
     page_clear();
     draw_box(1, 2, 38, 9, 0x0B, "System");
     draw_box(41, 2, 38, 9, 0x0B, "Clock");
-    draw_box(1, 12, 78, 8, 0x0B, "Keys");
+    draw_box(1, 12, 78, 11, 0x0B, "Keys");
 
     char vendor[13], brand[49];
     cpu_vendor(vendor);
@@ -941,19 +1628,22 @@ static void info_draw(void) {
     vga_text(43, 3, "Date", 0x03);
     vga_text(43, 4, "Time", 0x03);
     vga_text(43, 5, "Uptime", 0x03);
-    vga_text(43, 6, "Timer", 0x03);
+    vga_text(43, 6, "Files", 0x03);
     vga_text(43, 7, "History", 0x03);
     vga_text(43, 8, "Best snake", 0x03);
+    vga_text(43, 9, "Best tetris", 0x03);
 
     static const char *const keys[][2] = {
         { "F1",  "Shell: type commands (try 'help'), Up/Down recalls history" },
         { "F2",  "Info: this page, refreshed every second" },
-        { "F3",  "Settings: colors, clock, serial mirror, snake speed" },
-        { "F4",  "Games: launch snake" },
-        { "Tab", "Next tab (outside the Shell)" },
-        { "Esc", "Back to the Shell (outside the Shell)" },
+        { "F3",  "Settings: colors, clock, serial mirror, sound, snake speed" },
+        { "F4",  "Games: Snake and Tetris" },
+        { "F5",  "Files: browse, create (N), rename (R), delete (D), edit (Enter)" },
+        { "F6",  "Editor: Ctrl+S saves, Esc goes back to Files" },
+        { "Tab", "Next tab (outside the Shell and the Editor)" },
+        { "Esc", "Back to the Shell (from Info, Settings, Games and Files)" },
     };
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         vga_text(3, 13 + i, keys[i][0], 0x0E);
         vga_text(10, 13 + i, keys[i][1], 0x07);
     }
@@ -964,7 +1654,7 @@ static void info_draw(void) {
 }
 
 /* ---------- Settings tab ---------- */
-#define SET_COUNT 5
+#define SET_COUNT 6
 
 static int set_sel;
 
@@ -978,7 +1668,7 @@ static const char *const speed_names[3] = { "Slow", "Normal", "Fast" };
 static void settings_draw(void) {
     static const char *const labels[SET_COUNT] = {
         "Text color", "Background", "Clock in status bar",
-        "Mirror output to serial", "Snake speed"
+        "Mirror output to serial", "Sound (PC speaker)", "Snake speed"
     };
     page_clear();
     draw_box(1, 2, 56, 9, 0x0B, "Settings");
@@ -992,6 +1682,7 @@ static void settings_draw(void) {
         case 1:  name = color_names[(color >> 4) & 7]; break;
         case 2:  name = set_clock ? "On" : "Off"; break;
         case 3:  name = serial_on ? "On" : "Off"; break;
+        case 4:  name = set_sound ? "On" : "Off"; break;
         default: name = speed_names[set_speed]; break;
         }
         char v[40];
@@ -1033,6 +1724,7 @@ static void settings_change(int dir) {
         break;
     case 2: set_clock = !set_clock; break;
     case 3: serial_on = !serial_on; break;
+    case 4: set_sound = !set_sound; beep(880, 60); break;   /* chirps when turned on */
     default: set_speed = (set_speed + dir + 3) % 3; break;
     }
     settings_draw();
@@ -1040,17 +1732,301 @@ static void settings_change(int dir) {
 }
 
 /* ---------- Games tab ---------- */
+#define GAME_COUNT 2
+static int games_sel;
+
 static void games_draw(void) {
+    static const char *const names[GAME_COUNT] = { "Snake", "Tetris" };
+    static const char *const help[GAME_COUNT][3] = {
+        { "Steer with the arrow keys or WASD and eat the * to grow.",
+          "Don't hit the walls or yourself. Q or Esc quits the game.",
+          "Speed can be changed in Settings (F3)." },
+        { "Stack falling pieces into full rows to clear them.",
+          "Left/Right move, Up rotates, Down drops faster, Space drops at once.",
+          "P pauses, Q or Esc quits. It speeds up every 10 lines." },
+    };
     page_clear();
-    draw_box(1, 2, 78, 13, 0x0B, "Games");
-    vga_clear_area(3, 4, 74, 1, 0x1F);
-    vga_text(5, 4, "Snake", 0x1F);
-    vga_text(5, 6, "Steer with the arrow keys or WASD and eat the * to grow.", 0x07);
-    vga_text(5, 7, "Don't hit the walls or yourself. Q or Esc quits the game.", 0x07);
-    vga_text(5, 8, "Speed can be changed in Settings (F3).", 0x07);
-    vga_text(5, 10, "Best score this session:", 0x03);
-    vga_num(30, 10, snake_best, 0x0F);
-    vga_text(5, 12, "Press Enter to play.", 0x0E);
+    draw_box(1, 2, 78, 16, 0x0B, "Games");
+    for (int i = 0; i < GAME_COUNT; i++) {
+        uint8_t a = (i == games_sel) ? 0x1F : 0x07;
+        vga_clear_area(3, 4 + i, 74, 1, a);
+        vga_text(5, 4 + i, names[i], a);
+        vga_text(62, 4 + i, "best", a);
+        vga_num(67, 4 + i, i == 0 ? snake_best : tetris_best, a);
+    }
+    for (int i = 0; i < 3; i++) vga_text(5, 8 + i, help[games_sel][i], 0x07);
+    vga_text(5, 12, "Scores are kept until you reboot.", 0x08);
+    vga_text(5, 14, "Up/Down to choose, Enter to play.", 0x0E);
+}
+
+static void ui_switch(int t);
+
+/* ---------- Files tab ---------- */
+enum { FM_BROWSE, FM_NEW, FM_RENAME, FM_DELETE };
+
+static int files_sel;                          /* index in the list of used files */
+static int files_mode = FM_BROWSE;
+static char files_in[FS_NAME];                 /* name being typed */
+static size_t files_in_n;
+static char files_msg[56];
+
+static void files_set_msg(const char *m) { strcopy(files_msg, m, sizeof files_msg); }
+
+static const char *fs_err_text(int e) {
+    switch (e) {
+    case FS_ERR_FULL:   return "Filesystem full";
+    case FS_ERR_EXISTS: return "A file with that name already exists";
+    case FS_ERR_NAME:   return "Bad name (letters, digits . _ -  max 15 chars)";
+    default:            return "No such file";
+    }
+}
+
+static bool name_char(int k) {
+    return (k >= 'a' && k <= 'z') || (k >= 'A' && k <= 'Z') ||
+           (k >= '0' && k <= '9') || k == '.' || k == '_' || k == '-';
+}
+
+static void files_clamp(void) {
+    int n = fs_count();
+    if (files_sel >= n) files_sel = n - 1;
+    if (files_sel < 0) files_sel = 0;
+}
+
+static void files_select_name(const char *name) {
+    int n = fs_count();
+    for (int k = 0; k < n; k++)
+        if (!strcmp(fs[fs_nth(k)].name, name)) { files_sel = k; return; }
+}
+
+static void files_draw(void) {
+    page_clear();
+    files_clamp();
+    int n = fs_count();
+    int sel = n ? fs_nth(files_sel) : -1;
+
+    draw_box(1, 2, 38, 18, 0x0B, "Files");
+    draw_box(40, 2, 39, 18, 0x0B, sel >= 0 ? fs[sel].name : "Preview");
+
+    if (!n) {
+        vga_text(3, 4, "(no files yet)", 0x08);
+        vga_text(3, 6, "Press N to create one.", 0x07);
+    }
+    for (int k = 0; k < n; k++) {
+        int i = fs_nth(k), y = 3 + k;
+        uint8_t a = (k == files_sel) ? 0x1F : 0x07;
+        vga_clear_area(2, y, 36, 1, a);
+        vga_text(3, y, fs[i].name, a);
+        if (ed_loaded && !strcmp(ed_name, fs[i].name))
+            vga_text(20, y, ed_dirty ? "edit*" : "edit", (k == files_sel) ? 0x1E : 0x0E);
+        int nd = 1;
+        for (uint32_t v = fs[i].size; v >= 10; v /= 10) nd++;
+        vga_num(34 - nd, y, fs[i].size, a);
+        vga_text(35, y, "B", a);
+    }
+
+    if (sel >= 0) {                            /* preview of the selected file */
+        int row = 0, col = 0;
+        for (uint16_t p = 0; p < fs[sel].size && row < 16; p++) {
+            char c = fs[sel].data[p];
+            if (c == '\n') { row++; col = 0; continue; }
+            if (col < 37) vga_put(41 + col, 3 + row, (c < 32 || c > 126) ? '.' : c, 0x07);
+            col++;
+        }
+    }
+
+    int x = vga_num(2, 20, (uint32_t)n, 0x08);
+    vga_text(x, 20, n == 1 ? " file, " : " files, ", 0x08);
+    x = vga_num(x + (n == 1 ? 7 : 8), 20, fs_bytes(), 0x08);
+    vga_text(x, 20, " bytes used (RAM only: lost on reboot)", 0x08);
+
+    if (files_msg[0]) vga_text(2, 21, files_msg, 0x0E);
+
+    if (files_mode == FM_NEW || files_mode == FM_RENAME) {
+        vga_clear_area(0, 22, VGA_W, 1, 0x30);
+        vga_text(1, 22, files_mode == FM_NEW ? "New file name: " : "Rename to: ", 0x30);
+        int px = files_mode == FM_NEW ? 16 : 12;
+        vga_text(px, 22, files_in, 0x3F);
+        vga_put(px + (int)files_in_n, 22, '_', 0x3F);
+        vga_text(50, 22, "Enter: ok   Esc: cancel", 0x30);
+    } else if (files_mode == FM_DELETE && sel >= 0) {
+        vga_clear_area(0, 22, VGA_W, 1, 0x40);
+        vga_text(1, 22, "Delete ", 0x4F);
+        vga_text(8, 22, fs[sel].name, 0x4F);
+        vga_text(9 + (int)strlen(fs[sel].name), 22, "?  y = yes, any other key = no", 0x4F);
+    }
+}
+
+/* Returns true when the key was used; false lets the generic tab keys run. */
+static bool files_key(int k) {
+    int n = fs_count();
+
+    if (files_mode == FM_BROWSE) {
+        files_set_msg("");
+        if (k == KEY_UP)   { if (files_sel > 0) files_sel--; files_draw(); return true; }
+        if (k == KEY_DOWN) { if (files_sel + 1 < n) files_sel++; files_draw(); return true; }
+        if (k == 'n' || k == 'N') {
+            files_mode = FM_NEW; files_in_n = 0; files_in[0] = 0;
+            files_draw(); return true;
+        }
+        if (!n) return false;
+        int i = fs_nth(files_sel);
+        if (k == '\n' || k == 'e' || k == 'E') {
+            int e = ed_open(fs[i].name);
+            if (e < 0) { files_set_msg(fs_err_text(e)); files_draw(); }
+            else ui_switch(TAB_EDITOR);        /* it redraws the screen itself */
+            return true;
+        }
+        if (k == 'r' || k == 'R') {
+            files_mode = FM_RENAME;
+            strcopy(files_in, fs[i].name, FS_NAME);
+            files_in_n = strlen(files_in);
+            files_draw(); return true;
+        }
+        if (k == 'd' || k == 'D' || k == KEY_DEL) {
+            files_mode = FM_DELETE; files_draw(); return true;
+        }
+        return false;
+    }
+
+    if (files_mode == FM_DELETE) {
+        if (k == 'y' || k == 'Y') {
+            int i = fs_nth(files_sel);
+            if (i >= 0) { fs_delete(i); files_set_msg("Deleted"); }
+        } else files_set_msg("Cancelled");
+        files_mode = FM_BROWSE;
+        files_draw(); return true;
+    }
+
+    /* FM_NEW / FM_RENAME: line input */
+    if (k == 27) {
+        files_mode = FM_BROWSE; files_set_msg("Cancelled");
+    } else if (k == '\b') {
+        if (files_in_n) files_in[--files_in_n] = 0;
+    } else if (k == '\n') {
+        int e;
+        if (files_mode == FM_NEW) {
+            e = fs_create(files_in);
+            if (e >= 0) files_set_msg("Created");
+        } else {
+            int i = fs_nth(files_sel);
+            char old[FS_NAME];
+            strcopy(old, fs[i].name, FS_NAME);
+            e = fs_rename(i, files_in);
+            if (e >= 0) {
+                if (ed_loaded && !strcmp(ed_name, old)) strcopy(ed_name, files_in, FS_NAME);
+                files_set_msg("Renamed");
+            }
+        }
+        if (e < 0) files_set_msg(fs_err_text(e));      /* stay in the prompt */
+        else { files_mode = FM_BROWSE; files_select_name(files_in); }
+    } else if (name_char(k) && files_in_n + 1 < FS_NAME) {
+        files_in[files_in_n++] = (char)k;
+        files_in[files_in_n] = 0;
+        files_set_msg("");
+    }
+    files_draw();
+    return true;
+}
+
+/* ---------- Editor tab ---------- */
+#define ED_ROWS   21                           /* text rows 2..22 */
+#define ED_GUTTER 5                            /* line-number column width */
+#define ED_COLS   (VGA_W - ED_GUTTER)
+
+/* Moves the blinking hardware cursor without touching the shell's cur_x/cur_y. */
+static void hw_cursor(int x, int y) {
+    uint16_t pos = (uint16_t)(y * VGA_W + x);
+    outb(0x3D4, 0x0F); outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E); outb(0x3D5, (uint8_t)(pos >> 8));
+}
+
+static void ed_draw(void) {
+    page_clear();
+    if (!ed_loaded) {
+        vga_center(10, "No file is open.", 0x0F);
+        vga_center(12, "Open one from the Files tab (F5), or type: edit <name>", 0x07);
+        cursor_hide();
+        return;
+    }
+
+    /* keep the cursor visible: vertical and horizontal scrolling */
+    size_t line = ed_cur_line(), col = ed_cur_col();
+    if (line < ed_top) ed_top = line;
+    if (line >= ed_top + ED_ROWS) ed_top = line - ED_ROWS + 1;
+    if (col < ed_left_col) ed_left_col = col;
+    if (col >= ed_left_col + ED_COLS) ed_left_col = col - ED_COLS + 1;
+
+    /* header bar */
+    vga_clear_area(0, 1, VGA_W, 1, 0x30);
+    vga_text(1, 1, ed_name, 0x3F);
+    if (ed_dirty) vga_text(2 + (int)strlen(ed_name), 1, "[modified]", 0x3E);
+    vga_text(40, 1, "Ln", 0x30);   vga_num(43, 1, (uint32_t)line + 1, 0x3F);
+    vga_text(52, 1, "Col", 0x30);  vga_num(56, 1, (uint32_t)col + 1, 0x3F);
+    int x = vga_num(64, 1, (uint32_t)ed_len, 0x3F);
+    vga_text(x, 1, "/", 0x30);
+    x = vga_num(x + 1, 1, FS_SIZE, 0x30);
+    vga_text(x, 1, " B", 0x30);
+
+    /* text area */
+    size_t pos = 0;
+    for (size_t l = 0; l < ed_top; l++) pos = ed_line_end(pos) + 1;
+    for (int r = 0; r < ED_ROWS; r++) {
+        int y = 2 + r;
+        if (pos > ed_len) {                    /* past the end of the text */
+            vga_put(0, y, '~', 0x08);
+            continue;
+        }
+        uint32_t no = (uint32_t)(ed_top + (size_t)r + 1);
+        int nd = 1;
+        for (uint32_t v = no; v >= 10; v /= 10) nd++;
+        vga_num(4 - nd, y, no, 0x08);
+        size_t le = ed_line_end(pos);
+        for (int c = 0; c < ED_COLS; c++) {
+            size_t p = pos + ed_left_col + (size_t)c;
+            if (p >= le) break;
+            char ch = ed_buf[p];
+            vga_put(ED_GUTTER + c, y, (ch < 32 || ch > 126) ? '.' : ch, 0x0F);
+        }
+        pos = le + 1;
+    }
+
+    /* bottom bar: message, or key hints */
+    vga_clear_area(0, 23, VGA_W, 1, 0x30);
+    if (ed_msg[0]) vga_text(1, 23, ed_msg, 0x3E);
+    else vga_text(1, 23, "Ctrl+S save   Esc files   Tab = 4 spaces   Home/End  PgUp/PgDn", 0x30);
+
+    hw_cursor(ED_GUTTER + (int)(col - ed_left_col), 2 + (int)(line - ed_top));
+}
+
+static void editor_key(int k) {
+    ed_msg[0] = 0;
+    if (ed_loaded) {
+        switch (k) {
+        case KEY_CTRL('s'): ed_save(); break;
+        case KEY_UP:    ed_up(); break;
+        case KEY_DOWN:  ed_down(); break;
+        case KEY_LEFT:  ed_left(); break;
+        case KEY_RIGHT: ed_right(); break;
+        case KEY_HOME:  ed_home(); break;
+        case KEY_END:   ed_end(); break;
+        case KEY_PGUP:  for (int i = 0; i < ED_ROWS - 1; i++) ed_up(); break;
+        case KEY_PGDN:  for (int i = 0; i < ED_ROWS - 1; i++) ed_down(); break;
+        case KEY_DEL:   ed_delete(); break;
+        case '\b':      ed_backspace(); break;
+        case '\n':
+            if (!ed_insert('\n')) ed_set_msg("File is full (2048 bytes)");
+            break;
+        case '\t':
+            for (int i = 0; i < 4; i++)
+                if (!ed_insert(' ')) { ed_set_msg("File is full (2048 bytes)"); break; }
+            break;
+        default:
+            if (k >= 32 && k < 127 && !ed_insert((char)k))
+                ed_set_msg("File is full (2048 bytes)");
+            break;
+        }
+    }
+    ed_draw();
 }
 
 /* ---------- tab switching and the main loop ---------- */
@@ -1059,6 +2035,8 @@ static void ui_show_page(void) {
     case TAB_SHELL:    shell_enter(); break;
     case TAB_INFO:     info_draw(); break;
     case TAB_SETTINGS: settings_draw(); break;
+    case TAB_FILES:    files_draw(); break;
+    case TAB_EDITOR:   ed_draw(); break;
     default:           games_draw(); break;
     }
     ui_apply_cursor();
@@ -1079,7 +2057,7 @@ static void ui_init(void) {
     draw_tabbar();
     draw_status();
     puts(OS_NAME " v" OS_VERSION " booted.\n");
-    puts("F1-F4 switch tabs. Type 'help' for commands.\n\n");
+    puts("F1-F6 switch tabs. Type 'help' for commands.\n\n");
     shell_prompt();
     ui_apply_cursor();
     pit_prev = pit_read();
@@ -1098,8 +2076,22 @@ static void ui_tick(void) {                    /* once a second: clock + info */
 }
 
 static void ui_key(int k) {
-    if (k >= KEY_F1 && k <= KEY_F4) { ui_switch(k - KEY_F1); return; }
-    if (cur_tab == TAB_SHELL) { shell_key(k); return; }
+    if (k >= KEY_F1 && k <= KEY_F6) { ui_switch(k - KEY_F1); return; }
+    if (cur_tab == TAB_SHELL) {
+        shell_key(k);
+        if (pending_tab >= 0) {                /* e.g. the 'edit' command */
+            int t = pending_tab;
+            pending_tab = -1;
+            ui_switch(t);
+        }
+        return;
+    }
+    if (cur_tab == TAB_EDITOR) {
+        if (k == 27) ui_switch(TAB_FILES);
+        else editor_key(k);
+        return;
+    }
+    if (cur_tab == TAB_FILES && files_key(k)) return;
     if (k == 27) { ui_switch(TAB_SHELL); return; }
     if (k == '\t') { ui_switch((cur_tab + 1) % TAB_COUNT); return; }
 
@@ -1110,10 +2102,14 @@ static void ui_key(int k) {
         else if (k == KEY_RIGHT || k == '\n') settings_change(1);
         return;
     }
-    if (cur_tab == TAB_GAMES && k == '\n') {
-        launch_snake();
-        games_draw();                          /* refresh the best score */
-        return;
+    if (cur_tab == TAB_GAMES) {
+        if (k == KEY_UP)   { games_sel = (games_sel + GAME_COUNT - 1) % GAME_COUNT; games_draw(); return; }
+        if (k == KEY_DOWN) { games_sel = (games_sel + 1) % GAME_COUNT; games_draw(); return; }
+        if (k == '\n') {
+            if (games_sel == 0) launch_snake(); else launch_tetris();
+            games_draw();                      /* refresh the best score */
+            return;
+        }
     }
     if (k == KEY_LEFT)  ui_switch((cur_tab + TAB_COUNT - 1) % TAB_COUNT);
     if (k == KEY_RIGHT) ui_switch((cur_tab + 1) % TAB_COUNT);
@@ -1124,6 +2120,12 @@ void kernel_main(uint32_t magic, uint32_t *mbi) {
     pit_init();
     if (magic == 0x2BADB002 && (mbi[0] & 1))   /* flags bit 0: mem_* valid */
         mem_upper_kb = mbi[2];
+
+    fs_seed("readme.txt",
+            "Welcome to MyOS!\n"
+            "Files live in RAM and vanish on reboot.\n"
+            "Try: ls, cat, write, append, edit, mv, cp, rm, df\n");
+    fs_seed("notes.txt", "A scratch file. Open it in the Editor (F6).\n");
 
     splash();
     ui_init();
